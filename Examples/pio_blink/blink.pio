@@ -1,0 +1,75 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+; 
+; 主程式（CPU）透過 FIFO 傳送一個數值進來，決定閃爍的速度。
+
+.pio_version 0 // only requires PIO version 0
+
+.program blink
+
+    ; 初始化階段，只會執行一次
+    pull block      ; 1. 從 FIFO 拉取資料到 OSR
+                    ;
+                    ; 動作: 狀態機 (State Machine) 嘗試從 TX FIFO (傳送緩衝區) 
+                    ; 拉取 32-bit 的資料放入 OSR (Output Shift Register)。
+                    ;
+                    ; block 表示如果 FIFO 是空的（CPU 還沒送資料），程式會停在這裡等待 
+                    ;(Stall)，直到有資料進來為止。
+
+    out y, 32       ; 2. 將 OSR 的 32 bits 移入 Y 暫存器
+                    ;
+                    ; 注意，這個 32 是資料長度為 32bits，不是時間
+                    ; 動作: 從 OSR 移出 (Shift out) 32 bits 的資料，存入 Y 暫存器。
+                    ; 為什麼存入 Y?: 在 PIO 中，X 暫存器通常用作「計數器 (Counter)」，
+                    ; 而 Y 暫存器通常用作「數值儲存 (Storage)」。因為我們希望閃爍頻率固定，
+                    ; 所以把這個數值存在 Y 裡面備份，之後可以反覆讀取。
+
+.wrap_target        ; 迴圈起點標記
+
+    mov x, y        ; 3. 重置計數器 X
+                    ;
+                    ; 動作: 把 Y 暫存器的值（剛才從 CPU 拿到的延遲時間）複製到 X 暫存器。
+                    ; 目的: 因為接下來的指令會遞減 X，如果不重新從 Y 複製，下次迴圈時 X 就已經是 0 了。
+
+    set pins, 1     ; 4. LED 亮 (High)
+                    ;
+                    ; 動作: 將設定好的 Pin 腳位拉高 (High)。這會點亮 LED。
+                    ; 注意: 具體是哪一根 Pin，是在 C/MicroPython 程式碼中透過 
+                    ; sm_config_set_set_pins 設定的，而不是寫死在這裡
+
+lp1:                ; 這只是一個標籤 (Label)，給 jmp 指令跳轉用的。
+
+    jmp x-- lp1     ; 5. 延遲迴圈 (亮燈時間)
+                    ;
+                    ; 邏輯: 檢查 X 的值。
+                    ; 如果不為 0：X = X - 1，然後跳轉 (Jump) 回 lp1。
+                    ; 如果為 0：不跳轉，繼續執行下一行。
+                    ; 效果: 這構成了一個「忙碌等待 (Busy-wait)」迴圈。它會消耗掉 X 
+                    ; 個時脈週期。這是用來控制 LED 亮多久的關鍵。
+                    ; 注意：因為 jmp 最後一次 x=0 時也會消耗 1 個週期，所以如果要讓它精
+                    ; 確計算 100 次的話，x 就得是 99。
+
+    mov x, y        ; 6. 重置計數器 X
+    set pins, 0     ; 7. LED 滅 (Low)
+    
+lp2:
+    jmp x-- lp2     ; 8. 延遲迴圈 (滅燈時間)
+
+.wrap               ; 自動跳回 .wrap_target
+                    ; PIO 的特殊機制。程式執行到這裡，會無條件、零延遲地跳回 
+                    ; .wrap_target，形成無限迴圈。
+
+
+% c-sdk {
+// this is a raw helper function for use by the user which sets up the GPIO output, and configures the SM to output on a particular pin
+
+void blink_program_init(PIO pio, uint sm, uint offset, uint pin) {
+   pio_gpio_init(pio, pin);
+   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+   pio_sm_config c = blink_program_get_default_config(offset);
+   sm_config_set_set_pins(&c, pin, 1);
+   pio_sm_init(pio, sm, offset, &c);
+}
+%}
